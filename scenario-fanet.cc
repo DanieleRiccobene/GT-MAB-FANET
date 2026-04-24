@@ -703,7 +703,9 @@ int main (int argc, char *argv[])
       if (bestBs)
         {
           // Attach the UE to the selected mmWave eNB and the primary LTE eNB
-          mmwaveHelper->Attach (ueDev, bestBs, lteEnbDevs.Get (0));
+          NetDeviceContainer singleUe;
+          singleUe.Add (ueDev);
+          mmwaveHelper->AttachToEnb (singleUe, bestBs, lteEnbDevs.Get (0));
           uesPerBs[bestBsIndex]++;
         }
       else
