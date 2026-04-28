@@ -1,8 +1,8 @@
 import argparse
 import json
-from es_env_cmabNR import EnergySavingEnv
+from es_env_GTcmab import EnergySavingEnv
 # Importiamo la nuova classe
-from cmabNR import MultiAgentGameMAB 
+from GTcmab import MultiAgentGameMAB 
 import wandb
 import numpy as np
 
@@ -26,7 +26,7 @@ if __name__ == '__main__':
     base_scenario_configuration = json.loads(params)
 
     # --- INIZIO PIPELINE SEQUENZIALE ---
-    lista_droni = [3, 5, 7, 9]
+    lista_droni = [7, 9]
     
     for num_drones in lista_droni:
         print(f"\n{'='*60}")

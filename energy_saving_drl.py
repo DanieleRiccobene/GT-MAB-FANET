@@ -1,12 +1,43 @@
 import argparse
 import json
-from gymnasium.utils.env_checker import check_env
 from es_env_dqn import EnergySavingEnv
-from discrete_dqn import DQNAgent
-from ppo_discrete import PPOAgent
-import wandb
-import statistics
 import numpy as np
+
+
+class _NoOpWandb:
+    class Table:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class Histogram:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class _Plot:
+        @staticmethod
+        def line(*args, **kwargs):
+            return None
+
+    plot = _Plot()
+
+    @staticmethod
+    def init(*args, **kwargs):
+        return None
+
+    @staticmethod
+    def log(*args, **kwargs):
+        return None
+
+    @staticmethod
+    def finish(*args, **kwargs):
+        return None
+
+
+try:
+    import wandb
+except Exception as exc:
+    print(f"[WARNING] wandb unavailable ({exc}). Continuing without wandb logging.")
+    wandb = _NoOpWandb()
 
 def to_float_flat(obs):
     arr = np.array(obs, dtype=np.float32)
@@ -25,11 +56,17 @@ if __name__ == '__main__':
                         help="Path to the ns-3 mmWave O-RAN environment")
     parser.add_argument("--num_steps", type=int, default=1000,
                         help="Number of steps to run in the environment")
+    parser.add_argument("--episodes", type=int, default=100,
+                        help="Number of episodes to run for each drone configuration")
+    parser.add_argument("--steps_per_episode", type=int, default=97,
+                        help="Number of environment steps to run in each episode")
+    parser.add_argument("--drones", type=str, default="3,5,7,9",
+                        help="Comma-separated drone counts to train, for example 3,5,7,9")
     parser.add_argument("--optimized", action="store_true",
                         help="Enable optimization mode")
     parser.add_argument("--verbose", action="store_true",
                         help="Enable verbose logging")
-    parser.add_argument("--alg", type=str, choices=["PPO", "DQN"],
+    parser.add_argument("--alg", type=str, choices=["PPO", "DQN"], default="DQN",
                         help="Algorithm type (PPO, DQN)")
     
     parser.add_argument("--clip_range", type=float, default=0.2)
@@ -48,6 +85,17 @@ if __name__ == '__main__':
     alg = args.alg
 
     try:
+        if alg == "PPO":
+            from ppo_discrete import PPOAgent as AgentClass
+        else:
+            from discrete_dqn import DQNAgent as AgentClass
+    except Exception as exc:
+        raise RuntimeError(
+            f"Cannot initialize {alg}: missing or broken training dependency ({exc}). "
+            "Install the required agent dependencies before starting ns-3."
+        ) from exc
+
+    try:
         with open(configuration_path) as params_file:
             params = params_file.read()
     except FileNotFoundError:
@@ -55,8 +103,8 @@ if __name__ == '__main__':
         exit(-1)
 
     base_scenario_configuration = json.loads(params)
-    lista_droni = [3, 5, 7, 9]
-for num_drones in lista_droni:
+    lista_droni = [int(item.strip()) for item in args.drones.split(",") if item.strip()]
+    for num_drones in lista_droni:
         print(f"\n{'='*60}")
         print(f" AVVIO TRAINING {args.alg} CON {num_drones} DRONI ")
         print(f"{'='*60}\n")
@@ -82,7 +130,7 @@ for num_drones in lista_droni:
         print("action space:", n_actions)
         
         if args.alg == "PPO":
-            agent = PPOAgent(
+            agent = AgentClass(
                 state_dim=state_dim,
                 n_actions=n_actions,
                 learning_rate=1e-5,   
@@ -106,7 +154,7 @@ for num_drones in lista_droni:
                 "vf_coef": args.vf_coef,
             }
         else: # DQN
-            agent = DQNAgent(state_dim=state_dim, action_list=action_list)
+            agent = AgentClass(state_dim=state_dim, action_list=action_list)
             wandb_config = {"algo": "DQN"}
 
         wandb.init(
@@ -119,10 +167,11 @@ for num_drones in lista_droni:
         )
         
         episode = 1
-        while episode <= 100:
+        while episode <= args.episodes:
             cumulative_reward = 0
             active_rus_steps = []
-            for step in range(2, 99):
+            completed_steps = 0
+            for step in range(1, args.steps_per_episode + 1):
                 print(f'\n[Droni: {num_drones}] Ep {episode}, Step {step} ', end='', flush=True)
                 s = to_float_flat(obs)
 
@@ -145,6 +194,7 @@ for num_drones in lista_droni:
                 active_rus = binary_action.count('1')
                 active_rus_steps.append(active_rus)
                 obs = obs_next
+                completed_steps = step
 
                 if done or env.crashed:
                     break
@@ -181,7 +231,8 @@ for num_drones in lista_droni:
                 for i, cell_id in enumerate(env.cellList):
                     log_dict[f"average_energy_consumption/drone_{cell_id}"] = float(mean_per_drone[i])
 
-            if episode == 100 and not env.crashed and step >= 80:
+            min_success_steps = min(80, args.steps_per_episode)
+            if episode == args.episodes and not env.crashed and completed_steps >= min_success_steps:
                 # 1. Format the array into a 2D list of [step_index, value]
                 qos_data = [[i, val] for i, val in enumerate(env.avg_qos)]
                 actCost_data = [[i, val] for i, val in enumerate(env.average_energy_consumption)]
@@ -234,14 +285,15 @@ for num_drones in lista_droni:
                 log_dict["RLF Distribution"] = wandb.Histogram(env.avg_rlf)
                 log_dict["NRDBL Distribution"] = wandb.Histogram(env.avg_nrdbl)
 
-            if not env.crashed and step >= 80:
+            if not env.crashed and completed_steps >= min_success_steps:
                 wandb.log(log_dict, commit=True)
                 episode += 1
             else:
-                print(f"\n[WARNING] Crash ep {episode}")
+                print(f"\n[WARNING] Crash or incomplete episode {episode}")
                 
             env._reset_stats()
-            obs, info = env.reset()
+            if episode <= args.episodes:
+                obs, info = env.reset()
             
         print(f"\nCompletato addestramento DQN con {num_drones} droni.")
         wandb.finish()

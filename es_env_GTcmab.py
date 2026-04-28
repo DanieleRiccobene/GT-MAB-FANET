@@ -124,6 +124,7 @@ class EnergySavingEnv(NsOranEnv):
         self.crashed = False
         self.previous_energy_joules = None
         self.current_action = []
+        self.latest_ue_counts = {}
 
     @override
     def _compute_action(self, action):
@@ -203,9 +204,12 @@ class EnergySavingEnv(NsOranEnv):
                    
         ue_complete_kpms = []
         if ue_kpms is None or len(ue_kpms) == 0:
-            print("No UE KPMs found. Marking crashed.")
-            self.crashed = True
-            # Dummy observation (includes energy columns) so _compute_reward and step return valid shape.
+            if self.num_steps > 20: 
+                print(f"No UE KPMs found at step {self.num_steps}. Marking crashed.")
+                self.crashed = True
+            
+            self.latest_ue_counts = {}
+            # Restituiamo un'osservazione di zeri per non interrompere il loop
             self.observations = pd.DataFrame(
                 [np.zeros(len(self.columns_state), dtype=np.float32)],
                 columns=self.columns_state,
@@ -220,6 +224,8 @@ class EnergySavingEnv(NsOranEnv):
         columns = ['ueImsiComplete'] + kpms_raw + ['state']
         df = pd.DataFrame(ue_complete_kpms, columns=columns)
         df["timestamp"] = self.last_timestamp
+
+        self.latest_ue_counts = df['nrCellId'].dropna().astype(int).value_counts().to_dict()
         df, columns= self.getRLFCounter(df, columns)
         df = self.ue_centric_tocell_centric(df)
         self.observations = self.offline_training_preprocessing(df)
@@ -255,6 +261,9 @@ class EnergySavingEnv(NsOranEnv):
     def _compute_reward(self):
         self.num_steps += 1
         cell_df = self.observations[self.columns_reward].copy()
+        if self.observations is None or self.observations.empty:
+            # Ritorna reward neutre per evitare errori di indicizzazione iloc[0]
+            return {cell: np.array([0.0, 0.0], dtype=np.float32) for cell in self.cellList}
         db_row = {}
         db_row['timestamp'] = self.last_timestamp
         db_row['ueImsiComplete'] = None
@@ -346,7 +355,10 @@ class EnergySavingEnv(NsOranEnv):
     @override
     def get_info(self):
         # Pass the calculated costs to the agent
-        return {'agent_costs': self.latest_individual_costs}
+        return {
+            'agent_costs': self.latest_individual_costs,
+            'ue_counts': getattr(self, 'latest_ue_counts', {})
+        }
     
     # ... (Metodi ausiliari invariati: _init_datalake, _fill_datalake, processing, etc.)
     @override

@@ -18,6 +18,14 @@
 #include "ns3/basic-energy-source-helper.h"
 #include "ns3/simple-device-energy-model.h"
 
+#include <algorithm>
+#include <iostream>
+#include <limits>
+#include <map>
+#include <set>
+#include <utility>
+#include <vector>
+
 using namespace ns3;
 using namespace mmwave;
 
@@ -27,6 +35,171 @@ using namespace mmwave;
 
 NS_LOG_COMPONENT_DEFINE ("ScenarioThreeFanetHybrid");
 
+const uint32_t MAX_USERS_PER_GNB = 10;
+
+struct GnbDistanceCandidate
+{
+  double distance;
+  Ptr<MmWaveEnbNetDevice> enbDevice;
+};
+
+static std::map<uint16_t, std::set<uint64_t>> g_connectedUesByGnb;
+static std::map<uint64_t, uint16_t> g_currentGnbByUe;
+
+void
+RemoveUeFromCurrentGnb (uint64_t ueId)
+{
+  auto current = g_currentGnbByUe.find (ueId);
+  if (current == g_currentGnbByUe.end ())
+    {
+      return;
+    }
+
+  uint16_t oldCellId = current->second;
+  auto load = g_connectedUesByGnb.find (oldCellId);
+  if (load != g_connectedUesByGnb.end ())
+    {
+      load->second.erase (ueId);
+    }
+  g_currentGnbByUe.erase (current);
+}
+
+Ptr<MmWaveEnbNetDevice>
+SelectCapacityAwareGnb (Ptr<NetDevice> ueDevice,
+                        NetDeviceContainer mmWaveEnbDevs,
+                        uint64_t ueId,
+                        double &selectedDistance)
+{
+  std::vector<GnbDistanceCandidate> candidates;
+  Vector uePos = ueDevice->GetNode ()->GetObject<MobilityModel> ()->GetPosition ();
+
+  for (uint32_t i = 0; i < mmWaveEnbDevs.GetN (); ++i)
+    {
+      Ptr<MmWaveEnbNetDevice> enbDevice = DynamicCast<MmWaveEnbNetDevice> (mmWaveEnbDevs.Get (i));
+      if (!enbDevice)
+        {
+          continue;
+        }
+
+      Vector enbPos = enbDevice->GetNode ()->GetObject<MobilityModel> ()->GetPosition ();
+      candidates.push_back ({CalculateDistance (uePos, enbPos), enbDevice});
+    }
+
+  std::sort (candidates.begin (), candidates.end (),
+             [] (const GnbDistanceCandidate &a, const GnbDistanceCandidate &b) {
+               return a.distance < b.distance;
+             });
+
+  for (const auto &candidate : candidates)
+    {
+      uint16_t cellId = candidate.enbDevice->GetCellId ();
+      uint32_t currentLoad = g_connectedUesByGnb[cellId].size ();
+      if (currentLoad < MAX_USERS_PER_GNB)
+        {
+          selectedDistance = candidate.distance;
+          return candidate.enbDevice;
+        }
+
+      std::cout << "UE " << ueId << " skipped gNB " << cellId
+                << " at distance " << candidate.distance
+                << " m because it is full. Current load: "
+                << currentLoad << "/" << MAX_USERS_PER_GNB << std::endl;
+    }
+
+  selectedDistance = std::numeric_limits<double>::infinity ();
+  return nullptr;
+}
+
+bool
+AttachMcUeToCapacityAwareGnb (Ptr<MmWavePointToPointEpcHelper> epcHelper,
+                              Ptr<NetDevice> ueDevice,
+                              NetDeviceContainer mmWaveEnbDevs,
+                              NetDeviceContainer lteEnbDevs)
+{
+  Ptr<McUeNetDevice> mcDevice = ueDevice->GetObject<McUeNetDevice> ();
+  NS_ASSERT_MSG (mcDevice, "Expected an MC UE net device");
+  NS_ASSERT_MSG (mmWaveEnbDevs.GetN () > 0 && lteEnbDevs.GetN () > 0,
+                 "empty lte or mmwave enb device container");
+
+  uint64_t ueId = mcDevice->GetImsi ();
+  RemoveUeFromCurrentGnb (ueId);
+
+  double selectedDistance = std::numeric_limits<double>::infinity ();
+  Ptr<MmWaveEnbNetDevice> selectedMmWaveEnb =
+      SelectCapacityAwareGnb (ueDevice, mmWaveEnbDevs, ueId, selectedDistance);
+
+  if (!selectedMmWaveEnb)
+    {
+      std::cout << "UE " << ueId
+                << " could not be connected: all gNBs are full at maximum capacity "
+                << MAX_USERS_PER_GNB << std::endl;
+      return false;
+    }
+
+  Vector uePos = ueDevice->GetNode ()->GetObject<MobilityModel> ()->GetPosition ();
+  double minLteDistance = std::numeric_limits<double>::infinity ();
+  Ptr<NetDevice> lteClosestEnbDevice;
+  for (NetDeviceContainer::Iterator i = lteEnbDevs.Begin (); i != lteEnbDevs.End (); ++i)
+    {
+      Vector enbPos = (*i)->GetNode ()->GetObject<MobilityModel> ()->GetPosition ();
+      double distance = CalculateDistance (uePos, enbPos);
+      if (distance < minLteDistance)
+        {
+          minLteDistance = distance;
+          lteClosestEnbDevice = *i;
+        }
+    }
+  NS_ASSERT (lteClosestEnbDevice);
+
+  for (NetDeviceContainer::Iterator i = mmWaveEnbDevs.Begin (); i != mmWaveEnbDevs.End (); ++i)
+    {
+      Ptr<MmWaveEnbNetDevice> mmWaveEnb = (*i)->GetObject<MmWaveEnbNetDevice> ();
+      std::map<uint8_t, Ptr<MmWaveComponentCarrier>> mmWaveEnbCcMap = mmWaveEnb->GetCcMap ();
+
+      for (auto itEnb = mmWaveEnbCcMap.begin (); itEnb != mmWaveEnbCcMap.end (); ++itEnb)
+        {
+          Ptr<MmWaveComponentCarrierEnb> ccEnb =
+              DynamicCast<MmWaveComponentCarrierEnb> (itEnb->second);
+          uint16_t mmWaveCellId = ccEnb->GetCellId ();
+          Ptr<MmWavePhyMacCommon> configParams = ccEnb->GetPhy ()->GetConfigurationParameters ();
+          ccEnb->GetPhy ()->AddUePhy (mcDevice->GetImsi (), ueDevice);
+
+          std::map<uint8_t, Ptr<MmWaveComponentCarrierUe>> ueCcMap = mcDevice->GetMmWaveCcMap ();
+          for (auto itUe = ueCcMap.begin (); itUe != ueCcMap.end (); ++itUe)
+            {
+              itUe->second->GetPhy ()->RegisterOtherEnb (mmWaveCellId, configParams, mmWaveEnb);
+            }
+          NS_LOG_INFO ("mmWaveCellId " << mmWaveCellId);
+        }
+    }
+
+  Ptr<LteEnbNetDevice> enbLteDevice = lteClosestEnbDevice->GetObject<LteEnbNetDevice> ();
+  Ptr<EpcUeNas> lteUeNas = mcDevice->GetNas ();
+  lteUeNas->Connect (enbLteDevice->GetCellId (), enbLteDevice->GetDlEarfcn ());
+
+  if (epcHelper)
+    {
+      epcHelper->ActivateEpsBearer (ueDevice,
+                                    lteUeNas,
+                                    mcDevice->GetImsi (),
+                                    EpcTft::Default (),
+                                    EpsBearer (EpsBearer::NGBR_VIDEO_TCP_DEFAULT));
+    }
+
+  mcDevice->SetLteTargetEnb (enbLteDevice);
+  mcDevice->SetMmWaveTargetEnb (selectedMmWaveEnb);
+
+  uint16_t selectedCellId = selectedMmWaveEnb->GetCellId ();
+  g_connectedUesByGnb[selectedCellId].insert (ueId);
+  g_currentGnbByUe[ueId] = selectedCellId;
+
+  std::cout << "UE " << ueId << " connected to gNB " << selectedCellId
+            << ". Distance: " << selectedDistance
+            << " m. Current load: "
+            << g_connectedUesByGnb[selectedCellId].size () << "/"
+            << MAX_USERS_PER_GNB << std::endl;
+  return true;
+}
 
 
 std::ofstream outFile;
@@ -582,7 +755,7 @@ int main (int argc, char *argv[])
   allEnbNodes.Add (mmWaveEnbNodes);
 
     Ptr<ListPositionAllocator> enbPositionAlloc = CreateObject<ListPositionAllocator> ();
-  
+  enbPositionAlloc->Add (Vector (2000.0, 2000.0, 50.0));
   switch(nMmWaveEnbNodes)
   {
     case 3: {
@@ -642,9 +815,11 @@ int main (int argc, char *argv[])
   // --- POSIZIONAMENTO UE (GEOMETRIA FANET) ---
   // =========================================================================
   MobilityHelper uemobility;
-  uemobility.SetPositionAllocator ("ns3::RandomRectanglePositionAllocator",
-                                   "X", StringValue ("ns3::UniformRandomVariable[Min=0.0|Max=4000.0]"),
-                                   "Y", StringValue ("ns3::UniformRandomVariable[Min=0.0|Max=4000.0]"));
+  uemobility.SetPositionAllocator ("ns3::RandomDiscPositionAllocator",
+                                 "X", DoubleValue (2000.0),
+                                 "Y", DoubleValue (2000.0),
+                                 "Theta", StringValue ("ns3::UniformRandomVariable[Min=0.0|Max=6.283185]"),
+                                 "Rho", StringValue ("ns3::UniformRandomVariable[Min=0.0|Max=2000.0]"));
   uemobility.SetMobilityModel ("ns3::ConstantPositionMobilityModel");
   uemobility.Install (ueNodes);
 
@@ -653,7 +828,7 @@ int main (int argc, char *argv[])
   NetDeviceContainer mcUeDevs = mmwaveHelper->InstallMcUeDevice (ueNodes);
 
   const double rxCoverageThresholdDbm = -100.0;
-  PrintEstimatedCoverageForMmWaveCells (mmwaveHelper, mmWaveEnbDevs, rxCoverageThresholdDbm);
+  //PrintEstimatedCoverageForMmWaveCells (mmwaveHelper, mmWaveEnbDevs, rxCoverageThresholdDbm);
 
   internet.Install (ueNodes);
   Ipv4InterfaceContainer ueIpIface;
@@ -667,53 +842,9 @@ int main (int argc, char *argv[])
     }
 
   mmwaveHelper->AddX2Interface (lteEnbNodes, mmWaveEnbNodes);
-  // mmwaveHelper->AttachToClosestEnb (mcUeDevs, mmWaveEnbDevs, lteEnbDevs);
-  // =========================================================================
-  // --- CUSTOM ATTACHMENT WITH CAPACITY LIMIT ---
-  // =========================================================================
-  uint32_t maxUesPerBs = 10; // Enforce maximum number of UEs per drone
-  std::map<uint32_t, uint32_t> uesPerBs; 
-
   for (uint32_t u = 0; u < mcUeDevs.GetN (); ++u)
     {
-      Ptr<NetDevice> ueDev = mcUeDevs.Get (u);
-      Ptr<MobilityModel> ueMob = ueDev->GetNode ()->GetObject<MobilityModel> ();
-      
-      Ptr<NetDevice> bestBs = nullptr;
-      uint32_t bestBsIndex = 0;
-      double minDistance = std::numeric_limits<double>::max ();
-      
-      for (uint32_t b = 0; b < mmWaveEnbDevs.GetN (); ++b)
-        {
-          // Skip this base station if it has reached the max connection limit
-          if (uesPerBs[b] >= maxUesPerBs) continue;
-          
-          Ptr<NetDevice> enbDev = mmWaveEnbDevs.Get (b);
-          Ptr<MobilityModel> enbMob = enbDev->GetNode ()->GetObject<MobilityModel> ();
-          double distance = ueMob->GetDistanceFrom (enbMob);
-          
-          if (distance < minDistance)
-            {
-              minDistance = distance;
-              bestBs = enbDev;
-              bestBsIndex = b;
-            }
-        }
-        
-      if (bestBs)
-        {
-          // Attach the UE to the selected mmWave eNB and the primary LTE eNB
-          NetDeviceContainer singleUe;
-          singleUe.Add (ueDev);
-          NetDeviceContainer singleEnb;
-          singleEnb.Add (bestBs);
-          mmwaveHelper->AttachToClosestEnb (singleUe, singleEnb, lteEnbDevs);
-          uesPerBs[bestBsIndex]++;
-        }
-      else
-        {
-          NS_LOG_UNCOND ("UE " << u << " could not attach: All nearby BSs reached the maximum connection limit of " << maxUesPerBs << ".");
-        }
+      AttachMcUeToCapacityAwareGnb (epcHelper, mcUeDevs.Get (u), mmWaveEnbDevs, lteEnbDevs);
     }
 
   // =========================================================================
@@ -877,43 +1008,17 @@ int main (int argc, char *argv[])
       break;
 
       case 0: {
-        for (double i = 0.0; i < simTime; i = i + indicationPeriodicity)
-          {
-            for (int j = 0; j < nMmWaveEnbNodes; j++)
-              {
-                Ptr<MmWaveEnbNetDevice> mmdev = DynamicCast<MmWaveEnbNetDevice> (mmWaveEnbDevs.Get (j));
-                Ptr<LteEnbNetDevice> ltedev = DynamicCast<LteEnbNetDevice> (lteEnbDevs.Get (0));
-                Simulator::Schedule (Seconds (i), &EnergyHeuristic::ProbabilityState, energyHeur, probOn, probIdle, probSleep, probOff, mmdev, ltedev);
-              }
-          }
+        
       }
       break;
 
       case 1: {
-        for (double i = 0.0; i < simTime; i = i + indicationPeriodicity)
-          {
-            for (int j = 0; j < nMmWaveEnbNodes && bsOn!=0; j++)
-              {
-                Ptr<MmWaveEnbNetDevice> mmdev = DynamicCast<MmWaveEnbNetDevice> (mmWaveEnbDevs.Get (j));
-                Simulator::Schedule (Seconds (i), &EnergyHeuristic::CountBestUesSinr, energyHeur, sinrTh, mmdev);
-              }
-            Ptr<LteEnbNetDevice> ltedev = DynamicCast<LteEnbNetDevice> (lteEnbDevs.Get (0));
-            Simulator::Schedule (Seconds (i), &EnergyHeuristic::TurnOnBsSinrPos, energyHeur, nMmWaveEnbNodes, mmWaveEnbDevs, "static", BsStatus, ltedev);
-          }
+        
       }
       break;
 
       case 2: {
-        for (double i = 0.0; i < simTime; i = i + indicationPeriodicity)
-          {
-            for (int j = 0; j < nMmWaveEnbNodes && bsOn!=0; j++)
-              {
-                Ptr<MmWaveEnbNetDevice> mmdev = DynamicCast<MmWaveEnbNetDevice> (mmWaveEnbDevs.Get (j));
-                Simulator::Schedule (Seconds (i), &EnergyHeuristic::CountBestUesSinr, energyHeur, sinrTh, mmdev);
-              }
-            Ptr<LteEnbNetDevice> ltedev = DynamicCast<LteEnbNetDevice> (lteEnbDevs.Get (0));
-            Simulator::Schedule (Seconds (i), &EnergyHeuristic::TurnOnBsSinrPos, energyHeur, nMmWaveEnbNodes, mmWaveEnbDevs, "dynamic", BsStatus, ltedev);
-          }
+        
       }
       break;
       
@@ -931,12 +1036,12 @@ int main (int argc, char *argv[])
   // --- TRACCIAMENTO KPI (Invariato per evitare il KeyError in Python) ---
   Ptr<LteHelper> lteHelper = CreateObject<LteHelper> ();
   lteHelper->Initialize ();
-  lteHelper->EnablePhyTraces ();
-  lteHelper->EnableMacTraces ();
+  //lteHelper->EnablePhyTraces ();
+  //lteHelper->EnableMacTraces ();
 
   // Esporta le posizioni (I droni si muoveranno, quindi questi file conterranno solo lo spawn)
-  PrintGnuplottableUeListToFile ("ues.txt");
-  PrintGnuplottableEnbListToFile ("enbs.txt");
+  //PrintGnuplottableUeListToFile ("ues.txt");
+  //PrintGnuplottableEnbListToFile ("enbs.txt");
   
   Ptr<LteEnbNetDevice> ltedev = DynamicCast<LteEnbNetDevice> (lteEnbDevs.Get (0));
   Ptr<LteEnbRrc> lte_rrc = ltedev->GetRrc ();  
