@@ -385,6 +385,161 @@ class SQLiteDatabaseAPI:
 
         result = self.cursor.execute(query, (timestamp,)).fetchall()
         return result if result else None # [(observation_tuple)]
+
+    @lock_connection
+    def read_kpms_relaxed(self, timestamp: int, required_kpms: list) -> list[tuple]:
+        """Query KPI values at a timestamp without requiring every KPI table to have
+        a row for the same UE. This avoids dropping UEs when some reports arrive in
+        only a subset of tables.
+
+        The output format matches read_kpms(): tuples with ueImsiComplete first,
+        followed by required_kpms in the given order.
+        """
+        tables_involved: dict[list] = {}
+        found_kpms = [False] * len(required_kpms)
+
+        for table_name, keys in self.tables.items():
+            for index, required_kpm in enumerate(required_kpms):
+                if required_kpm in keys:
+                    if table_name not in tables_involved:
+                        tables_involved[table_name] = []
+                    tables_involved[table_name].append(required_kpm)
+                    found_kpms[index] = True
+
+        not_found_kpms = [kpm for found, kpm in zip(found_kpms, required_kpms) if not found]
+        if not_found_kpms:
+            raise ValueError(f"Column(s) {not_found_kpms} not found in any table.")
+
+        kpm_to_tables = defaultdict(list)
+        for table, kpms in tables_involved.items():
+            for kpm in kpms:
+                kpm_to_tables[kpm].append(table)
+
+        tables = list(tables_involved.keys())
+        ue_index_parts = [
+            f"SELECT ueImsiComplete, timestamp FROM {table_name} WHERE timestamp = ?"
+            for table_name in tables
+        ]
+        with_clause = " WITH ue_index AS (" + " UNION ".join(ue_index_parts) + ")"
+
+        select_clause = ["ue_index.ueImsiComplete"]
+        join_clause = []
+        for table_name in tables:
+            join_clause.append(
+                f"LEFT JOIN {table_name} ON ue_index.timestamp = {table_name}.timestamp "
+                f"AND ue_index.ueImsiComplete = {table_name}.ueImsiComplete"
+            )
+
+        for required_kpm in required_kpms:
+            if len(kpm_to_tables[required_kpm]) > 1:
+                for table_name in kpm_to_tables[required_kpm]:
+                    select_clause.append(
+                        f"{table_name}.{self.sanitize_column_name(required_kpm)} AS required_kpm_{table_name}"
+                    )
+            else:
+                table_name = kpm_to_tables[required_kpm][0]
+                select_clause.append(
+                    f"{table_name}.{self.sanitize_column_name(required_kpm)}"
+                )
+
+        query = (
+            with_clause
+            + f" SELECT {', '.join(select_clause)}"
+            + " FROM ue_index "
+            + " ".join(join_clause)
+            + " ORDER BY ue_index.ueImsiComplete"
+        )
+        parameters = tuple([timestamp] * len(tables))
+        result = self.cursor.execute(query, parameters).fetchall()
+        return result if result else None
+
+    @lock_connection
+    def read_kpms_latest_relaxed(self, timestamp: int, required_kpms: list) -> list[tuple]:
+        """Query KPI values using the latest row available at or before ``timestamp``
+        for each UE and each involved table.
+
+        This is more robust than exact timestamp joins because the ns-3 KPI files
+        are not guaranteed to emit every table for every UE at the same instant.
+        The output format matches read_kpms(): tuples with ueImsiComplete first,
+        followed by required_kpms in the given order.
+        """
+        tables_involved: dict[list] = {}
+        found_kpms = [False] * len(required_kpms)
+
+        for table_name, keys in self.tables.items():
+            for index, required_kpm in enumerate(required_kpms):
+                if required_kpm in keys:
+                    if table_name not in tables_involved:
+                        tables_involved[table_name] = []
+                    tables_involved[table_name].append(required_kpm)
+                    found_kpms[index] = True
+
+        not_found_kpms = [kpm for found, kpm in zip(found_kpms, required_kpms) if not found]
+        if not_found_kpms:
+            raise ValueError(f"Column(s) {not_found_kpms} not found in any table.")
+
+        kpm_to_tables = defaultdict(list)
+        for table, kpms in tables_involved.items():
+            for kpm in kpms:
+                kpm_to_tables[kpm].append(table)
+
+        tables = list(tables_involved.keys())
+        ctes = []
+        ue_index_parts = []
+        parameters = []
+
+        for table_name in tables:
+            latest_cte = f"{table_name}_latest"
+            ctes.append(
+                f"""{latest_cte} AS (
+                    SELECT src.*
+                    FROM {table_name} AS src
+                    INNER JOIN (
+                        SELECT ueImsiComplete, MAX(timestamp) AS latest_timestamp
+                        FROM {table_name}
+                        WHERE timestamp <= ?
+                        GROUP BY ueImsiComplete
+                    ) AS latest
+                    ON src.ueImsiComplete = latest.ueImsiComplete
+                    AND src.timestamp = latest.latest_timestamp
+                )"""
+            )
+            ue_index_parts.append(f"SELECT ueImsiComplete FROM {latest_cte}")
+            parameters.append(timestamp)
+
+        with_clause = "WITH " + ", ".join(ctes) + ", ue_index AS (" + " UNION ".join(ue_index_parts) + ")"
+
+        select_clause = ["ue_index.ueImsiComplete"]
+        join_clause = []
+        for table_name in tables:
+            latest_cte = f"{table_name}_latest"
+            join_clause.append(
+                f"LEFT JOIN {latest_cte} ON ue_index.ueImsiComplete = {latest_cte}.ueImsiComplete"
+            )
+
+        for required_kpm in required_kpms:
+            if len(kpm_to_tables[required_kpm]) > 1:
+                for table_name in kpm_to_tables[required_kpm]:
+                    latest_cte = f"{table_name}_latest"
+                    select_clause.append(
+                        f"{latest_cte}.{self.sanitize_column_name(required_kpm)} AS required_kpm_{table_name}"
+                    )
+            else:
+                table_name = kpm_to_tables[required_kpm][0]
+                latest_cte = f"{table_name}_latest"
+                select_clause.append(
+                    f"{latest_cte}.{self.sanitize_column_name(required_kpm)}"
+                )
+
+        query = (
+            with_clause
+            + f" SELECT {', '.join(select_clause)}"
+            + " FROM ue_index "
+            + " ".join(join_clause)
+            + " ORDER BY ue_index.ueImsiComplete"
+        )
+        result = self.cursor.execute(query, tuple(parameters)).fetchall()
+        return result if result else None
     
     def read_end_to_end_delay(self, timestamp: int):
 

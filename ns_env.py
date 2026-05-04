@@ -314,6 +314,8 @@ class NsOranEnv(gym.Env):
         self.metricsReadySemaphore = Semaphore(nameMetricsReadySemaphore, O_CREAT, mode=0o660, initial_value=0)
         self.controlSemaphore = Semaphore(nameControlSemaphore, O_CREAT, mode=0o660, initial_value=0)
         self.last_timestamp = 0
+        self.last_source_timestamp = 0
+        self._current_batch_timestamp = 0
         
         ### End create the Semaphores ###
         
@@ -490,7 +492,32 @@ class NsOranEnv(gym.Env):
         else:
             # Set here all the default settings
             self.return_info = False
-            
+        defer_initial_observation = bool((options or {}).get("defer_initial_observation", False))
+
+        if defer_initial_observation:
+            self.terminated = False
+            self.truncated = False
+            self._deferred_initial_observation_pending = True
+            self._await_first_kpi_after_deferred_reset = True
+            LOGGER.info(
+                "Reset deferred initial observation | scenario=%s sim_path=%s total_reset_s=%.3f",
+                self.scenario,
+                self.sim_path,
+                perf_counter() - reset_started_at,
+            )
+            self._log_resource_snapshot("reset_deferred")
+            empty_obs_frame = None
+            if hasattr(self, "_build_empty_observations_frame"):
+                try:
+                    empty_obs_frame = self._build_empty_observations_frame()
+                except Exception:
+                    empty_obs_frame = None
+            if empty_obs_frame is not None and hasattr(empty_obs_frame, "iloc"):
+                obs = [tuple(empty_obs_frame.iloc[0].values)]
+            else:
+                obs = []
+            return (obs, self.render()) if self.return_info else (obs, {})
+
         # The simulation may signal metrics readiness before the first KPI files
         # are fully populated. Keep waiting until at least one timestamp is ingested.
         initial_reset_timeout = getattr(self, "initial_reset_timeout_seconds", 120)
@@ -605,6 +632,24 @@ class NsOranEnv(gym.Env):
                 )
                 is_still_active = not self.is_simulation_over()
 
+    def _drain_metrics_ready_notifications(self):
+        drained = 0
+        while True:
+            try:
+                self.metricsReadySemaphore.acquire(timeout=0)
+                drained += 1
+            except BusyError:
+                break
+        if drained:
+            LOGGER.info(
+                "Drained stale metricsReady notifications | scenario=%s sim_path=%s count=%s last_timestamp=%s",
+                self.scenario,
+                self.sim_path,
+                drained,
+                self.last_timestamp,
+            )
+        return drained
+
     def step(self, action: object) -> tuple[object, SupportsFloat, bool, bool, dict[str, Any]]:
         step_started_at = perf_counter()
         self._step_count += 1
@@ -615,6 +660,10 @@ class NsOranEnv(gym.Env):
             action_started_at = perf_counter()
             actions = self._compute_action(action)
             compute_action_elapsed = perf_counter() - action_started_at
+
+            if getattr(self, "_deferred_initial_observation_pending", False):
+                self._drain_metrics_ready_notifications()
+                self._deferred_initial_observation_pending = False
             
             # Update the environment state and calculate the reward
             control_started_at = perf_counter()
@@ -629,6 +678,25 @@ class NsOranEnv(gym.Env):
             fill_started_at = perf_counter()
             self._fill_datalake()
             fill_elapsed = perf_counter() - fill_started_at
+            while getattr(self, "_await_first_kpi_after_deferred_reset", False) and self.last_timestamp <= 0 and not self.is_simulation_over():
+                LOGGER.info(
+                    "Discarding bootstrap KPI batch after deferred reset | scenario=%s sim_path=%s last_timestamp=%s",
+                    self.scenario,
+                    self.sim_path,
+                    self.last_timestamp,
+                )
+                control_started_at = perf_counter()
+                self.action_controller.create_control_action(self.last_timestamp, actions)
+                self.controlSemaphore.release()
+                control_elapsed += perf_counter() - control_started_at
+                wait_started_at = perf_counter()
+                self._wait_data_availability()
+                wait_elapsed += perf_counter() - wait_started_at
+                fill_started_at = perf_counter()
+                self._fill_datalake()
+                fill_elapsed += perf_counter() - fill_started_at
+            if getattr(self, "_await_first_kpi_after_deferred_reset", False) and self.last_timestamp > 0:
+                self._await_first_kpi_after_deferred_reset = False
         else:
             compute_action_elapsed = 0.0
             control_elapsed = 0.0
@@ -669,54 +737,59 @@ class NsOranEnv(gym.Env):
         """Helper function that collects from the csv files the latest kpms and uploads them in the Datalake
         """
         fill_started_at = perf_counter()
-        #print("fill datalake")
         self.datalake.acquire_connection()
         previous_timestamp = self.last_timestamp
-        new_last_timestamp = self.last_timestamp
-        cu_up_rows = 0
-        cu_cp_rows = 0
-        du_rows = 0
+        pending_rows = []
 
         for file_path in glob.glob(os.path.join(self.sim_path, 'cu-up-cell-*.txt')):
             cellId = self.datalake.extract_cellId(file_path)
             for row in self._iter_new_csv_rows(file_path):
-                timestamp = int(row['timestamp'])
-                if timestamp >= previous_timestamp:
-                    row['cellId'] = cellId
+                pending_rows.append(("cu_up", cellId, int(row["timestamp"]), row))
+
+        for file_path in glob.glob(os.path.join(self.sim_path, 'cu-cp-cell-*.txt')):
+            cellId = self.datalake.extract_cellId(file_path)
+            for row in self._iter_new_csv_rows(file_path):
+                pending_rows.append(("cu_cp", cellId, int(row["timestamp"]), row))
+
+        for file_path in glob.glob(os.path.join(self.sim_path, 'du-cell-*.txt')):
+            for row in self._iter_new_csv_rows(file_path):
+                pending_rows.append(("du", None, int(row["timestamp"]), row))
+
+        cu_up_rows = sum(1 for table_name, *_ in pending_rows if table_name == "cu_up")
+        cu_cp_rows = sum(1 for table_name, *_ in pending_rows if table_name == "cu_cp")
+        du_rows = sum(1 for table_name, *_ in pending_rows if table_name == "du")
+
+        if pending_rows:
+            source_timestamps = [source_timestamp for _, _, source_timestamp, _ in pending_rows]
+            batch_timestamp = max(source_timestamps)
+            self._current_batch_timestamp = batch_timestamp
+            self.last_source_timestamp = batch_timestamp
+
+            for table_name, cellId, _, raw_row in pending_rows:
+                row = dict(raw_row)
+                row["timestamp"] = batch_timestamp
+                if cellId is not None:
+                    row["cellId"] = cellId
+                if table_name == "cu_up":
                     if cellId == 1:
                         self.datalake.insert_lte_cu_up(row)
                     else:
                         self.datalake.insert_gnb_cu_up(row)
-                    new_last_timestamp = max(new_last_timestamp, timestamp)
-                    cu_up_rows += 1
-
-        for file_path in glob.glob(os.path.join(self.sim_path, 'cu-cp-cell-*.txt')):            
-            cellId = self.datalake.extract_cellId(file_path)
-            for row in self._iter_new_csv_rows(file_path):
-                timestamp = int(row['timestamp'])
-                if timestamp >= previous_timestamp:
-                    row['cellId'] = cellId
+                elif table_name == "cu_cp":
                     if cellId == 1:
                         self.datalake.insert_lte_cu_cp(row)
                     else:
                         self.datalake.insert_gnb_cu_cp(row)
-                    new_last_timestamp = max(new_last_timestamp, timestamp)
-                    cu_cp_rows += 1
-
-        for file_path in glob.glob(os.path.join(self.sim_path, 'du-cell-*.txt')):     
-            for row in self._iter_new_csv_rows(file_path):
-                timestamp = int(row['timestamp'])
-                if timestamp >= previous_timestamp:
+                else:
                     self.datalake.insert_du(row)
-                    new_last_timestamp = max(new_last_timestamp, timestamp)
-                    du_rows += 1
-        
-        self.last_timestamp = new_last_timestamp
+
+            self.last_timestamp = batch_timestamp
+
         self._fill_datalake_usecase()
         
         self.datalake.release_connection()
         LOGGER.debug(
-            "Fill datalake timing | scenario=%s sim_path=%s prev_timestamp=%s last_timestamp=%s cu_up_rows=%s cu_cp_rows=%s du_rows=%s elapsed_s=%.3f",
+            "Fill datalake timing | scenario=%s sim_path=%s prev_timestamp=%s last_timestamp=%s cu_up_rows=%s cu_cp_rows=%s du_rows=%s source_ts_min=%s source_ts_max=%s source_ts_spread_ms=%s elapsed_s=%.3f",
             self.scenario,
             self.sim_path,
             previous_timestamp,
@@ -724,6 +797,9 @@ class NsOranEnv(gym.Env):
             cu_up_rows,
             cu_cp_rows,
             du_rows,
+            min(source_timestamps) if pending_rows else None,
+            max(source_timestamps) if pending_rows else None,
+            (max(source_timestamps) - min(source_timestamps)) if pending_rows else None,
             perf_counter() - fill_started_at,
         )
 
