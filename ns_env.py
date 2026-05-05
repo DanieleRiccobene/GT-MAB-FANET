@@ -82,7 +82,7 @@ class NsOranEnv(gym.Env):
     datalake: SQLiteDatabaseAPI
 
     def __init__(self, render_mode:str=None, ns3_path:str=None, scenario:str=None, scenario_configuration:dict=None, output_folder:str=None,
-                 optimized:bool=True, skip_configuration:bool=False, control_header: list = [], log_file: str = '', control_file: str = ''):
+                 optimized:bool=True, skip_configuration:bool=False, skip_build:bool=False, control_header: list = [], log_file: str = '', control_file: str = ''):
         """Initialize environment 
         Args:
             render_mode (str): Select one of the render modes available.
@@ -107,6 +107,7 @@ class NsOranEnv(gym.Env):
         self.output_folder = output_folder
         self.optimized = optimized
         self.skip_configuration = skip_configuration
+        self.skip_build = skip_build
         self.control_header = control_header
         self.log_file = log_file
         self.control_file = control_file
@@ -223,13 +224,21 @@ class NsOranEnv(gym.Env):
 
             # Check whether path points to a valid installation
             self._run_ns3_command(configuration_command)
+        else:
+            print("[ns-3] Skipping configure", flush=True)
 
         # Build ns-3
         # We don't care about the progress bar of the SimulationRunner, thus we use subprocess.run and wait the build to end
+        if self.skip_build:
+            print("[ns-3] Skipping build", flush=True)
+            return
+
         j_argument = ['-j', str(os.cpu_count())] # if this makes problems just cut it
         self._run_ns3_command(['python3', build_program] + j_argument + ['build'])
 
     def _run_ns3_command(self, command: list[str]):
+        started_at = perf_counter()
+        print(f"[ns-3] Running: {' '.join(command)}", flush=True)
         result = subprocess.run(
             command,
             cwd=self.ns3_path,
@@ -246,6 +255,10 @@ class NsOranEnv(gym.Env):
             if stderr:
                 error_parts.append(f"stderr:\n{stderr}")
             raise RuntimeError("\n\n".join(error_parts))
+        print(
+            f"[ns-3] Done in {perf_counter() - started_at:.1f}s: {' '.join(command)}",
+            flush=True,
+        )
         return result
         
     def start_sim(self):

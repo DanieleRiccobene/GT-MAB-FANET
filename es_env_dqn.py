@@ -12,10 +12,7 @@ from gymnasium import spaces
 # 'SUM_QOSFLOW_PDCPPDUVOLUMEDL_FILTER' represents the sum of individual QoS flow volume for downlink PDU per cell.
 # 'SUM_TB_TOTNBRDL_1' is the total number of downlink transport blocks across cells.
 # 'SUM_RLF_VALUE' indicates the total number of radio link failures (RLFs):
-# UEs with L3servingSINR < -5 plus expected UEs that are absent from KPI rows.
-#     RLF_VALUE_{i} is computed as:
-#     numValues = tempDf[tempDf['L3servingSINR'] < -5]['timestamp'].count()
-#     df['RLF_VALUE'][df['timestamp'] == singleTimeStamp] = numValues
+# the C++ RLF_Counter KPM plus expected UEs that are absent from KPI rows.
 # 'SUM_ES_ON_COST' calculates the total cost associated with energy-saving states.
 #     ES_ON_COST is computed using the es_on_cost_calculation() method.
 # 'ZERO_COUNT' indicates how many zero states are present, using the zero_count() method.
@@ -30,9 +27,7 @@ from gymnasium import spaces
 # EEKPI_RL_{i} represents the ratio of QoS flow volume to transport blocks for downlink.
 # ES_ON_COST_{i} is included as part of the reward function (see es_on_cost_calculation()).
 # QOSFLOW_PDCPPDUVOLUMEDL_FILTER_{i} measures the QoS PDU volume for downlink flows.
-# RLF_COUNTER_{i} counts radio link failures where L3servingSINR < -5:
-#     numValues = tempDf[tempDf['L3servingSINR'] < -5]['timestamp'].count()
-#     rlfValue = (numValues / totalCount) * 100
+# RLF_COUNTER_{i} is read from the C++ RLF_Counter KPM.
 # RRU_PRBTOTDL_{i} represents the percentage of physical resource blocks used for downlink:
 #     df.apply(lambda x: (x['RRU_PRBUSEDDL'] / 139) * 100, axis=1)
 # TB_TOTNBRDLINITIAL_64QAM_RATIO_{i} computes the ratio of 64QAM transport blocks:
@@ -42,7 +37,7 @@ from gymnasium import spaces
 # Attributes extracted from ns-3 logs per cell:
 # - QOSFLOW_PDCPPDUVOLUMEDL_FILTER: QoS flow downlink volume.
 # - TB_TOTNBRDL_1: Total number of downlink transport blocks.
-# - L3servingSINR: Signal-to-Interference-plus-Noise Ratio (SINR) at Layer 3.
+# - RLF_Counter: radio link failure counter emitted by ns-3.
 # - RRU_PRBUSEDDL: Physical resource block usage for downlink.
 # - TB_TOTNBRDLINITIAL_64QAM, TB_TOTNBRDLINITIAL_QPSK, TB_TOTNBRDLINITIAL_16QAM: Transport block metrics by modulation scheme.
 # - ES_STATE: Energy-saving state (1 = OFF, 0 = ON).
@@ -57,9 +52,10 @@ class EnergySavingEnv(NsOranEnv):
             "state": "INTEGER"
         } 
         
-    def __init__(self, ns3_path:str, scenario_configuration:dict, output_folder:str, optimized:bool, do_heuristic:bool = False):
+    def __init__(self, ns3_path:str, scenario_configuration:dict, output_folder:str, optimized:bool, do_heuristic:bool = False, skip_configuration:bool = False, skip_build:bool = False):
         super().__init__(ns3_path=ns3_path, scenario='scenario-fanet', scenario_configuration=scenario_configuration,
                 output_folder=output_folder, optimized=optimized,
+                skip_configuration=skip_configuration, skip_build=skip_build,
                 control_header = ['timestamp','cellId','hoAllowed'], log_file='EsActions.txt', control_file='es_actions_for_ns3.csv')
         
         self.folder_name = "Simulation"
@@ -193,8 +189,8 @@ class EnergySavingEnv(NsOranEnv):
 
     @override
     def _get_obs(self):
-        # ["cellId", "QOSFLOW_PDCPPDUVOLUMEDL_FILTER", "TB_TOTNBRDL_1", "L3servingSINR", "RRU_PRBUSEDDL", "TB_TOTNBRDLINITIAL_64QAM", "TB_TOTNBRDLINITIAL_QPSK", "TB_TOTNBRDLINITIAL_16QAM", "ES_STATE"] #Database (1=ON, 0=OFF), Mavnenir(1=OFF, 0=ON)
-        kpms_raw = ["nrCellId", "QosFlow.PdcpPduVolumeDL_Filter", "TB.TotNbrDl.1", "L3 serving SINR", "RRU.PrbUsedDl", "TB.TotNbrDlInitial.64Qam", "TB.TotNbrDlInitial.Qpsk", "TB.TotNbrDlInitial.16Qam"]  
+        # Database state: 1 = active/available, 0 = energy-saving/unavailable.
+        kpms_raw = ["nrCellId", "QosFlow.PdcpPduVolumeDL_Filter", "TB.TotNbrDl.1", "RLF_Counter", "RRU.PrbUsedDl", "TB.TotNbrDlInitial.64Qam", "TB.TotNbrDlInitial.Qpsk", "TB.TotNbrDlInitial.16Qam"]  
         #print("last timestamp:", self.last_timestamp)     
         ue_kpms = self.datalake.read_kpms(self.last_timestamp, kpms_raw) 
         #print("ue kpms pre cell states update:", ue_kpms)
@@ -387,7 +383,7 @@ class EnergySavingEnv(NsOranEnv):
         """Function used to clean the dataframe with ns-3 row data
         """
         # Delete columns that are ue centric
-        df.drop(columns=['ueImsiComplete', 'L3 serving SINR'], inplace=True)
+        df.drop(columns=['ueImsiComplete', 'L3 serving SINR'], inplace=True, errors='ignore')
         # Remove completely identical rows
         df = df.drop_duplicates()
         # Reset index
@@ -515,46 +511,33 @@ class EnergySavingEnv(NsOranEnv):
         return df
 
     def getRLFCounter(self, df, columns):
-        # Ensure proper dtypes up-front
         df['timestamp'] = pd.to_numeric(df['timestamp'], errors='coerce').astype('Int64')
 
-        # --- robust numeric cleanup for SINR ---
-        sinr = df['L3 serving SINR'].astype(str)
+        if 'RLF_Counter' not in df.columns:
+            df['RLF_Counter'] = 0.0
+        df['RLF_Counter'] = pd.to_numeric(df['RLF_Counter'], errors='coerce').fillna(0.0)
+        df['RLF_Counter'] = df['RLF_Counter'].clip(lower=0.0)
+        df['RLF_VALUE'] = 0.0
+        if 'RLF_Counter' not in columns:
+            columns.append('RLF_Counter')
+        if 'RLF_VALUE' not in columns:
+            columns.append('RLF_VALUE')
 
-        # normalize unicode minus (U+2212) to ASCII hyphen and strip "dB"/spaces
-        sinr = (sinr
-                .str.replace('\u2212', '-', regex=False)      # − -> -
-                .str.replace('[dD][bB]', '', regex=True)      # remove 'dB'
-                .str.strip())
-
-        # extract the first numeric token if there is extra text
-        sinr = sinr.str.extract(r'([-+]?\d*\.?\d+)')[0]
-
-        # coerce to float; non-parsable -> NaN
-        sinr = pd.to_numeric(sinr, errors='coerce')
-
-        # map inf/-inf to finite values or NaN; choose what’s best for your logic
-        sinr = sinr.replace([np.inf, -np.inf], np.nan)
-
-        # finally assign back; NaNs won't count as < -5
-        df['L3 serving SINR'] = sinr
-
-        # init RLF columns
-        df['RLF_Counter'] = 0.0
-        df['RLF_VALUE'] = 0
-        if 'RLF_Counter' not in columns:  # avoid duplicates on repeated calls
-            columns += ['RLF_Counter', 'RLF_VALUE']
-
-        # group and compute
         grouped = df.groupby(['timestamp', 'nrCellId'], dropna=False)
         for (timestamp, cell), group in grouped:
-            total_count = group['L3 serving SINR'].notna().sum()  # only valid SINR rows
-            if total_count > 0:
-                num_values = (group['L3 serving SINR'] < -5).sum()
-                rlf_value = (num_values / total_count) * 100.0
-                mask = (df['timestamp'] == timestamp) & (df['nrCellId'] == cell)
-                df.loc[mask, 'RLF_Counter'] = rlf_value
-                df.loc[mask, 'RLF_VALUE'] = int(num_values)
+            rlf_values = group['RLF_Counter'].dropna()
+            if rlf_values.empty:
+                continue
+
+            unique_values = rlf_values.unique()
+            if len(unique_values) == 1 and unique_values[0] > 1.0:
+                rlf_value = float(unique_values[0])
+            else:
+                rlf_value = float(rlf_values.sum())
+
+            mask = (df['timestamp'] == timestamp) & (df['nrCellId'] == cell)
+            df.loc[mask, 'RLF_Counter'] = rlf_value
+            df.loc[mask, 'RLF_VALUE'] = rlf_value
 
         return df, columns
 

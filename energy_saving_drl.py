@@ -95,6 +95,10 @@ if __name__ == '__main__':
                         help="Comma-separated drone counts to train, for example 3,5,7,9")
     parser.add_argument("--optimized", action="store_true",
                         help="Enable optimization mode")
+    parser.add_argument("--skip_ns3_configure", action="store_true",
+                        help="Skip ns-3 configure before creating the environment")
+    parser.add_argument("--skip_ns3_build", action="store_true",
+                        help="Skip ns-3 build before creating the environment")
     parser.add_argument("--verbose", action="store_true",
                         help="Enable verbose logging")
     parser.add_argument("--alg", type=str, choices=["PPO", "DQN"], default="DQN",
@@ -145,11 +149,13 @@ if __name__ == '__main__':
 
         current_out_folder = f"{output_folder}_{num_drones}drones"
 
-        print('Creating ES Environment')
+        print('Creating ES Environment', flush=True)
         env = EnergySavingEnv(ns3_path=ns3_path, scenario_configuration=scenario_configuration,
-                              output_folder=current_out_folder, optimized=optimized)
+                              output_folder=current_out_folder, optimized=optimized,
+                              skip_configuration=args.skip_ns3_configure,
+                              skip_build=args.skip_ns3_build)
 
-        print('Environment Created!')
+        print('Environment Created!', flush=True)
         print('Launch reset ', end='', flush=True)
         obs, info = env.reset()
         print('done')

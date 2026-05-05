@@ -19,9 +19,10 @@ class EnergySavingEnv(NsOranEnv):
             "remainingEnergy": "REAL"
         } 
         
-    def __init__(self, ns3_path:str, scenario_configuration:dict, output_folder:str, optimized:bool, do_heuristic:bool = False):
+    def __init__(self, ns3_path:str, scenario_configuration:dict, output_folder:str, optimized:bool, do_heuristic:bool = False, skip_configuration:bool = False, skip_build:bool = False):
         super().__init__(ns3_path=ns3_path, scenario='scenario-fanet', scenario_configuration=scenario_configuration,
                 output_folder=output_folder, optimized=optimized,
+                skip_configuration=skip_configuration, skip_build=skip_build,
                 control_header = ['timestamp','cellId','hoAllowed'], log_file='EsActions.txt', control_file='es_actions_for_ns3.csv')
         
         self.folder_name = "Simulation"
@@ -218,7 +219,7 @@ class EnergySavingEnv(NsOranEnv):
 
     @override
     def _get_obs(self):
-        kpms_raw = ["nrCellId", "QosFlow.PdcpPduVolumeDL_Filter", "TB.TotNbrDl.1", "L3 serving SINR", "RRU.PrbUsedDl", "TB.TotNbrDlInitial.64Qam", "TB.TotNbrDlInitial.Qpsk", "TB.TotNbrDlInitial.16Qam"]  
+        kpms_raw = ["nrCellId", "QosFlow.PdcpPduVolumeDL_Filter", "TB.TotNbrDl.1", "RLF_Counter", "RRU.PrbUsedDl", "TB.TotNbrDlInitial.64Qam", "TB.TotNbrDlInitial.Qpsk", "TB.TotNbrDlInitial.16Qam"]  
         ue_kpms = self.datalake.read_kpms(self.last_timestamp, kpms_raw) 
         self._update_cell_states()  
                    
@@ -460,7 +461,7 @@ class EnergySavingEnv(NsOranEnv):
                     self.last_timestamp = timestamp
 
     def ue_centric_tocell_centric(self, df):
-        df.drop(columns=['ueImsiComplete', 'L3 serving SINR'], inplace=True)
+        df.drop(columns=['ueImsiComplete', 'L3 serving SINR'], inplace=True, errors='ignore')
         df = df.drop_duplicates()
         df.reset_index(drop=True, inplace=True)
         return df
@@ -550,25 +551,32 @@ class EnergySavingEnv(NsOranEnv):
 
     def getRLFCounter(self, df, columns):
         df['timestamp'] = pd.to_numeric(df['timestamp'], errors='coerce').astype('Int64')
-        sinr = df['L3 serving SINR'].astype(str)
-        sinr = (sinr.str.replace('\u2212', '-', regex=False).str.replace('[dD][bB]', '', regex=True).str.strip())
-        sinr = sinr.str.extract(r'([-+]?\d*\.?\d+)')[0]
-        sinr = pd.to_numeric(sinr, errors='coerce')
-        sinr = sinr.replace([np.inf, -np.inf], np.nan)
-        df['L3 serving SINR'] = sinr
-        df['RLF_Counter'] = 0.0
-        df['RLF_VALUE'] = 0
+
+        if 'RLF_Counter' not in df.columns:
+            df['RLF_Counter'] = 0.0
+        df['RLF_Counter'] = pd.to_numeric(df['RLF_Counter'], errors='coerce').fillna(0.0)
+        df['RLF_Counter'] = df['RLF_Counter'].clip(lower=0.0)
+        df['RLF_VALUE'] = 0.0
         if 'RLF_Counter' not in columns:
-            columns += ['RLF_Counter', 'RLF_VALUE']
+            columns.append('RLF_Counter')
+        if 'RLF_VALUE' not in columns:
+            columns.append('RLF_VALUE')
+
         grouped = df.groupby(['timestamp', 'nrCellId'], dropna=False)
         for (timestamp, cell), group in grouped:
-            total_count = group['L3 serving SINR'].notna().sum()
-            if total_count > 0:
-                num_values = (group['L3 serving SINR'] < -5).sum()
-                rlf_value = (num_values / total_count) * 100.0
-                mask = (df['timestamp'] == timestamp) & (df['nrCellId'] == cell)
-                df.loc[mask, 'RLF_Counter'] = rlf_value
-                df.loc[mask, 'RLF_VALUE'] = int(num_values)
+            rlf_values = group['RLF_Counter'].dropna()
+            if rlf_values.empty:
+                continue
+
+            unique_values = rlf_values.unique()
+            if len(unique_values) == 1 and unique_values[0] > 1.0:
+                rlf_value = float(unique_values[0])
+            else:
+                rlf_value = float(rlf_values.sum())
+
+            mask = (df['timestamp'] == timestamp) & (df['nrCellId'] == cell)
+            df.loc[mask, 'RLF_Counter'] = rlf_value
+            df.loc[mask, 'RLF_VALUE'] = rlf_value
         return df, columns
 
 
