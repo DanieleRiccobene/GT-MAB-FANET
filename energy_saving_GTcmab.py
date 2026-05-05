@@ -46,7 +46,7 @@ if __name__ == '__main__':
             do_heuristic=True
         )
 
-        obs, info = env.reset()
+        obs, info = env.reset(options={"return_info": True})
 
         print(f"Inizializzazione Multi-Agent Game MAB con {num_drones} agenti...")
         agent = MultiAgentGameMAB(num_agents=num_drones, epsilon_start=1.0, epsilon_end=0.05)
@@ -99,6 +99,7 @@ if __name__ == '__main__':
             avg_qos = float(np.mean(env.avg_qos)) if env.avg_qos else 0.0
             avg_nrbdl = float(np.mean(env.avg_nrbdl)) if env.avg_nrbdl else 0.0
             avg_rlf = float(np.mean(env.avg_rlf)) if env.avg_rlf else 0.0
+            avg_unconnected_ues = float(np.mean(env.avg_unconnected_ues)) if env.avg_unconnected_ues else 0.0
             avg_energy_saving = float(np.mean(env.average_energy_consumption)) if env.average_energy_consumption else 0.0
             avg_active_rus = float(np.mean(active_rus_steps)) if active_rus_steps else 0.0
             convergence_rate = float(np.mean(convergence_list))
@@ -110,6 +111,7 @@ if __name__ == '__main__':
                 "cumulative reward": float(cumulative_reward),
                 "avg active RUs": avg_active_rus,
                 "average RLF": avg_rlf,
+                "avg unconnected UEs": avg_unconnected_ues,
                 "average NRDBL": avg_nrbdl,
                 "convergence rate": convergence_rate,
                 "epsilon": float(agent.current_epsilon()),
@@ -182,7 +184,7 @@ if __name__ == '__main__':
                 print(f"[WARNING] Crash ep {episode}")
 
             env._reset_stats()
-            obs, info = env.reset()
+            obs, info = env.reset(options={"return_info": True})
             
         # FINE DEI 100 EPISODI PER QUESTI DRONI -> Chiudiamo il run su WandB
         print(f"\nCompletato addestramento con {num_drones} droni.")

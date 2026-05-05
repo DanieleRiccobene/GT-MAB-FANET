@@ -11,7 +11,8 @@ from gymnasium import spaces
 # Reward function components
 # 'SUM_QOSFLOW_PDCPPDUVOLUMEDL_FILTER' represents the sum of individual QoS flow volume for downlink PDU per cell.
 # 'SUM_TB_TOTNBRDL_1' is the total number of downlink transport blocks across cells.
-# 'SUM_RLF_VALUE' indicates the total number of radio link failures (RLFs) counted where L3servingSINR < -5.
+# 'SUM_RLF_VALUE' indicates the total number of radio link failures (RLFs):
+# UEs with L3servingSINR < -5 plus expected UEs that are absent from KPI rows.
 #     RLF_VALUE_{i} is computed as:
 #     numValues = tempDf[tempDf['L3servingSINR'] < -5]['timestamp'].count()
 #     df['RLF_VALUE'][df['timestamp'] == singleTimeStamp] = numValues
@@ -118,18 +119,37 @@ class EnergySavingEnv(NsOranEnv):
         self.avg_qos = []
         self.avg_nrdbl = []
         self.avg_rlf = []
+        self.avg_unconnected_ues = []
         self.average_energy_consumption = []
         self.energy_consumption_per_cell = []
         self.crashed = False
+        self.latest_connected_ues = 0
+        self.latest_unconnected_ues = 0
     
     def _reset_stats(self):
         self.avg_qos = []
         self.avg_nrdbl = []
         self.avg_rlf = []
+        self.avg_unconnected_ues = []
         self.average_energy_consumption = []
         self.crashed = False
         self.energy_consumption_per_cell = []
         self.previous_energy_joules = None
+        self.latest_connected_ues = 0
+        self.latest_unconnected_ues = 0
+
+    def _expected_total_ues(self):
+        try:
+            return int(self.scenario_configuration.get('ues', 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _update_unconnected_ue_count(self, df):
+        expected_ues = self._expected_total_ues()
+        connected_ues = int(df['ueImsiComplete'].dropna().nunique()) if 'ueImsiComplete' in df else 0
+        self.latest_connected_ues = connected_ues
+        self.latest_unconnected_ues = max(expected_ues - connected_ues, 0)
+        return self.latest_unconnected_ues
 
     @override
     def _compute_action(self, action):
@@ -149,15 +169,16 @@ class EnergySavingEnv(NsOranEnv):
             cell_act_comb_lst = []
             self.previous_inverted_action = "".join(["0" if b == 1 else "1" for b in bin_actions])
             for cell, bin_val in zip(self.cellList, bin_actions):
-                ns3_val = 0 if bin_val == 1 else 1
+                # ns-3 stores hoAllowed: 1 = active/available, 0 = energy-saving.
+                ns3_val = 1 if bin_val == 1 else 0
                 cell_act_comb_lst.append([cell, ns3_val])
         return cell_act_comb_lst
     
     def _update_cell_states(self):
         """Function that updates the states of the cells saved in a class variable
         """
-        cell_states_table = self.datalake.read_table('bsState')
         target_ts = self.last_timestamp - 100
+        cell_states_table = self.datalake.read_rows_at_timestamp('bsState', target_ts)
         latest_states = {}
         for cell_state in cell_states_table:
             if len(cell_state) >= 4 and cell_state[0] == target_ts:
@@ -187,7 +208,15 @@ class EnergySavingEnv(NsOranEnv):
         if ue_kpms is None or len(ue_kpms) == 0:
             print("No UE KPMs found for the last timestamp. Marking environment as crashed.")
             self.crashed = True
-            return [(0.0,) * len(self.columns_state)]
+            self.latest_connected_ues = 0
+            self.latest_unconnected_ues = self._expected_total_ues()
+            self.observations = pd.DataFrame(
+                [np.zeros(len(self.columns_state), dtype=np.float32)],
+                columns=self.columns_state,
+            )
+            if 'SUM_RLF_VALUE' in self.observations:
+                self.observations['SUM_RLF_VALUE'] = float(self.latest_unconnected_ues)
+            return self.observations.iloc[0].values
         else:
             for ue_kpm in ue_kpms:
                 # Create a new tuple with the same elements of ue_kpm + state in the latest position
@@ -202,6 +231,7 @@ class EnergySavingEnv(NsOranEnv):
         # Create the DataFrame
         df = pd.DataFrame(ue_complete_kpms, columns=columns)
         df["timestamp"] = self.last_timestamp
+        self._update_unconnected_ue_count(df)
         # Count the RLF at UEs level
         df, columns= self.getRLFCounter(df, columns)
         # Now we need to convert the dataframe from UEs centric to Cell centric
@@ -209,7 +239,7 @@ class EnergySavingEnv(NsOranEnv):
         self.observations = self.offline_training_preprocessing(df)
         
 
-        bs_rows = self.datalake.read_table('bsState')
+        bs_rows = self.datalake.read_latest_bsstate_before(self.last_timestamp, self.cellList)
         latest_by_cell = {}  # cellId -> (timestamp, remainingEnergy, energyFraction)
         for row in bs_rows:
             if len(row) < 6:
@@ -261,7 +291,7 @@ class EnergySavingEnv(NsOranEnv):
 
         energy_joules_list = []
         for cell in self.cellList:
-            col = f'energyFraction_{cell}' 
+            col = f'remainingEnergy_{cell}'
             if col in self.observations:
                 energy_joules_list.append(float(self.observations[col].iloc[0]))
             else:
@@ -288,7 +318,7 @@ class EnergySavingEnv(NsOranEnv):
             # Il peso (es. -0.001) va calibrato in base all'ordine di grandezza dei Watt
             penalty_battery += float(-0.001 * consumed_energy_joules[idx])
         
-        reward = cell_df['reward'][0] - penalty_battery
+        reward = cell_df['reward'][0] + penalty_battery
         # Grafana db 
         db_row['reward'] = reward
         # Insert the data into the datalake
@@ -297,6 +327,7 @@ class EnergySavingEnv(NsOranEnv):
         self.avg_qos.append(cell_df['SUM_QosFlow.PdcpPduVolumeDL_Filter'].iloc[0])
         self.avg_nrdbl.append((cell_df['SUM_TB.TotNbrDl.1'] + cell_df['ZERO_COUNT']).iloc[0])
         self.avg_rlf.append(cell_df['SUM_RLF_VALUE'].iloc[0])
+        self.avg_unconnected_ues.append(float(self.latest_unconnected_ues))
         self.average_energy_consumption.append(cell_df['SUM_ES_ON_COST'].iloc[0])
         
         per_cell_es = [
@@ -442,6 +473,9 @@ class EnergySavingEnv(NsOranEnv):
         }
         for sum_col, prefix in kpi_sums.items():
             cell_df[sum_col] = cell_df.filter(like=prefix).sum(axis=1)
+        cell_df['SUM_RLF_VALUE'] = (
+            cell_df['SUM_RLF_VALUE'] + float(getattr(self, 'latest_unconnected_ues', 0))
+        )
         # Ensure numeric type for summed columns
         for sum_col in kpi_sums.keys():
             cell_df[sum_col] = pd.to_numeric(cell_df[sum_col])
@@ -536,7 +570,7 @@ class EnergySavingEnv(NsOranEnv):
             # Initialize a list for TIME_DIFF_OBS
             time_diff_obs = []
             
-            # bsState convention: state == 0 -> active, state == 1 -> energy-saving.
+            # bsState stores hoAllowed: 1 -> active, 0 -> energy-saving.
             current_state_raw = self.cells_states.get(cell, 1)
             current_state = 1 if current_state_raw == 0 else 0
             
@@ -571,7 +605,7 @@ class EnergySavingEnv(NsOranEnv):
         and returns a list of corresponding KPMs in an inverted binary format.  
         """
         # Get actual bs state with present timestamp
-        cell_states_table = self.datalake.read_table('bsState')
+        cell_states_table = self.datalake.read_rows_at_timestamp('bsState', self.last_timestamp)
         states_of_interest = []
         # Filter rows only from last timestamp
         for cell_state in cell_states_table:

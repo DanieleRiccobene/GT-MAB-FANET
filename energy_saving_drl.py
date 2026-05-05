@@ -43,6 +43,37 @@ def to_float_flat(obs):
     arr = np.array(obs, dtype=np.float32)
     return arr.flatten()
 
+
+def count_active_rus_from_bs_state(env):
+    """Count active RUs from ns-3 bsState rows.
+
+    bsState stores the ns-3 hoAllowed flag:
+    State 1 = active/available, State 0 = energy-saving/unavailable.
+    """
+    try:
+        rows = env.datalake.read_table('bsState')
+    except Exception:
+        return None
+
+    latest_by_cell = {}
+    for row in rows:
+        if len(row) < 4:
+            continue
+
+        timestamp = row[0]
+        cell_id = row[2]
+        state = row[3]
+        if cell_id not in env.cellList or timestamp > env.last_timestamp:
+            continue
+
+        if cell_id not in latest_by_cell or timestamp > latest_by_cell[cell_id][0]:
+            latest_by_cell[cell_id] = (timestamp, state)
+
+    if not latest_by_cell:
+        return None
+
+    return sum(1 for _, state in latest_by_cell.values() if int(state) == 1)
+
 if __name__ == '__main__':
     #######################
     # Parse arguments #
@@ -170,6 +201,7 @@ if __name__ == '__main__':
         while episode <= args.episodes:
             cumulative_reward = 0
             active_rus_steps = []
+            commanded_active_rus_steps = []
             completed_steps = 0
             for step in range(1, args.steps_per_episode + 1):
                 print(f'\n[Droni: {num_drones}] Ep {episode}, Step {step} ', end='', flush=True)
@@ -191,8 +223,12 @@ if __name__ == '__main__':
                 dec_action = env.action_list[action_index]
                 bin_format = f'0{len(env.cellList)}b'
                 binary_action = format(dec_action, bin_format)
-                active_rus = binary_action.count('1')
+                commanded_active_rus = binary_action.count('1')
+                active_rus = count_active_rus_from_bs_state(env)
+                if active_rus is None:
+                    active_rus = commanded_active_rus
                 active_rus_steps.append(active_rus)
+                commanded_active_rus_steps.append(commanded_active_rus)
                 obs = obs_next
                 completed_steps = step
 
@@ -212,8 +248,10 @@ if __name__ == '__main__':
             avg_qos = np.mean(env.avg_qos) if env.avg_qos else 0.0
             avg_nrdbl = np.mean(env.avg_nrdbl) if env.avg_nrdbl else 0.0
             avg_rlf = np.mean(env.avg_rlf) if env.avg_rlf else 0.0
+            avg_unconnected_ues = np.mean(env.avg_unconnected_ues) if env.avg_unconnected_ues else 0.0
             avg_energy_saving = np.mean(env.average_energy_consumption) if env.average_energy_consumption else 0.0
             avg_active_rus = float(np.mean(active_rus_steps)) if active_rus_steps else 0.0
+            avg_commanded_active_rus = float(np.mean(commanded_active_rus_steps)) if commanded_active_rus_steps else 0.0
             
             log_dict = {
                 "activation cost": avg_energy_saving,
@@ -221,7 +259,9 @@ if __name__ == '__main__':
                 "average throughput": avg_qos,
                 "cumulative reward": float(cumulative_reward),
                 "avg active RUs": avg_active_rus,
+                "avg commanded active RUs": avg_commanded_active_rus,
                 "average RLF": avg_rlf,
+                "avg unconnected UEs": avg_unconnected_ues,
                 "average NRDBL": avg_nrdbl,
             }
 

@@ -107,11 +107,14 @@ class EnergySavingEnv(NsOranEnv):
         self.avg_qos = []
         self.avg_nrbdl = []
         self.avg_rlf = []
+        self.avg_unconnected_ues = []
         self.average_energy_consumption = []
         # per-step ES_ON_COST per drone, shape: (steps, len(cellList))
         self.energy_consumption_per_cell = []
         self.crashed = False
         self.latest_individual_costs = np.zeros(len(self.cellList), dtype=np.float32)
+        self.latest_connected_ues = 0
+        self.latest_unconnected_ues = 0
 
         self.current_action = []
 
@@ -119,19 +122,35 @@ class EnergySavingEnv(NsOranEnv):
         self.avg_qos = []
         self.avg_nrbdl = []
         self.avg_rlf = []
+        self.avg_unconnected_ues = []
         self.average_energy_consumption = []
         self.energy_consumption_per_cell = []
         self.crashed = False
         self.previous_energy_joules = None
         self.current_action = []
         self.latest_ue_counts = {}
+        self.latest_connected_ues = 0
+        self.latest_unconnected_ues = 0
+
+    def _expected_total_ues(self):
+        try:
+            return int(self.scenario_configuration.get('ues', 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _update_unconnected_ue_count(self, df):
+        expected_ues = self._expected_total_ues()
+        connected_ues = int(df['ueImsiComplete'].dropna().nunique()) if 'ueImsiComplete' in df else 0
+        self.latest_connected_ues = connected_ues
+        self.latest_unconnected_ues = max(expected_ues - connected_ues, 0)
+        return self.latest_unconnected_ues
 
     @override
     def _compute_action(self, action):
         """
         Converte l'azione (lista/array di 0 e 1) nel formato per NS-3.
         MAB Logic: 1 = Active (ON), 0 = Energy Saving (OFF)
-        NS3 Logic: 0 = Normal/Active, 1 = Energy Saving Mode
+        NS3 Logic: hoAllowed 1 = active/available, 0 = energy-saving.
         """
         cell_act_comb_lst = []
 
@@ -149,10 +168,7 @@ class EnergySavingEnv(NsOranEnv):
             for i, val in enumerate(action):
                 cell_id = self.cellList[i]
                 
-                # Inversione Logica:
-                # Se Agente dice 1 (ON) -> NS3 vuole 0 (Non è in saving)
-                # Se Agente dice 0 (OFF) -> NS3 vuole 1 (È in saving)
-                ns3_val = 0 if int(val) == 1 else 1
+                ns3_val = 1 if int(val) == 1 else 0
                 cell_act_comb_lst.append([cell_id, ns3_val])
             
             # Aggiorniamo la stringa binaria per statistiche (ZERO_COUNT)
@@ -167,14 +183,18 @@ class EnergySavingEnv(NsOranEnv):
             # Convertiamo in binario riempiendo con "0" dinamicamente in base a quanti droni abbiamo
             bin_format = f'0{len(self.cellList)}b'
             bin_actions = [int(i) for i in list(format(dec_action, bin_format))]
+            for cell, bin_val in zip(self.cellList, bin_actions):
+                ns3_val = 1 if bin_val == 1 else 0
+                cell_act_comb_lst.append([cell, ns3_val])
+            self.previous_inverted_action = "".join(["0" if b == 1 else "1" for b in bin_actions])
 
         self.current_action = cell_act_comb_lst
             
         return cell_act_comb_lst
     
     def _update_cell_states(self):
-        cell_states_table = self.datalake.read_table('bsState')
         target_ts = self.last_timestamp - 100
+        cell_states_table = self.datalake.read_rows_at_timestamp('bsState', target_ts)
         latest_states = {}
         for cell_state in cell_states_table:
             # Expected row layout from table "bsState":
@@ -209,11 +229,15 @@ class EnergySavingEnv(NsOranEnv):
                 self.crashed = True
             
             self.latest_ue_counts = {}
+            self.latest_connected_ues = 0
+            self.latest_unconnected_ues = self._expected_total_ues()
             # Restituiamo un'osservazione di zeri per non interrompere il loop
             self.observations = pd.DataFrame(
                 [np.zeros(len(self.columns_state), dtype=np.float32)],
                 columns=self.columns_state,
             )
+            if 'SUM_RLF_VALUE' in self.observations:
+                self.observations['SUM_RLF_VALUE'] = float(self.latest_unconnected_ues)
             return self.observations.iloc[0].values
         else:
             for ue_kpm in ue_kpms:
@@ -225,6 +249,7 @@ class EnergySavingEnv(NsOranEnv):
         df = pd.DataFrame(ue_complete_kpms, columns=columns)
         df["timestamp"] = self.last_timestamp
 
+        self._update_unconnected_ue_count(df)
         self.latest_ue_counts = df['nrCellId'].dropna().astype(int).value_counts().to_dict()
         df, columns= self.getRLFCounter(df, columns)
         df = self.ue_centric_tocell_centric(df)
@@ -233,7 +258,7 @@ class EnergySavingEnv(NsOranEnv):
         # Append per-cell battery from datalake "bsState" table (point 2 design).
         # Expected row layout:
         # (timestamp, ueImsiComplete, cellId, state, energyFraction, remainingEnergy)
-        bs_rows = self.datalake.read_table('bsState')
+        bs_rows = self.datalake.read_latest_bsstate_before(self.last_timestamp, self.cellList)
         latest_by_cell = {}  # cellId -> (timestamp, remainingEnergy, energyFraction)
         for row in bs_rows:
             if len(row) < 6:
@@ -337,6 +362,7 @@ class EnergySavingEnv(NsOranEnv):
         self.avg_qos.append(cell_df['SUM_QosFlow.PdcpPduVolumeDL_Filter'].iloc[0])
         self.avg_nrbdl.append(cell_df['SUM_TB.TotNbrDl.1'].iloc[0])
         self.avg_rlf.append(cell_df['SUM_RLF_VALUE'].iloc[0])
+        self.avg_unconnected_ues.append(float(self.latest_unconnected_ues))
         self.average_energy_consumption.append(cell_df['SUM_ES_ON_COST'].iloc[0])
         
         # Per-drone consumed power (Watts) for wandb logging
@@ -353,11 +379,13 @@ class EnergySavingEnv(NsOranEnv):
         return rewards_per_drone
     
     @override
-    def get_info(self):
+    def _get_info(self):
         # Pass the calculated costs to the agent
         return {
             'agent_costs': self.latest_individual_costs,
-            'ue_counts': getattr(self, 'latest_ue_counts', {})
+            'ue_counts': getattr(self, 'latest_ue_counts', {}),
+            'connected_ues': getattr(self, 'latest_connected_ues', 0),
+            'unconnected_ues': getattr(self, 'latest_unconnected_ues', 0),
         }
     
     # ... (Metodi ausiliari invariati: _init_datalake, _fill_datalake, processing, etc.)
@@ -493,6 +521,9 @@ class EnergySavingEnv(NsOranEnv):
         }
         for sum_col, prefix in kpi_sums.items():
             cell_df[sum_col] = cell_df.filter(like=prefix).sum(axis=1)
+        cell_df['SUM_RLF_VALUE'] = (
+            cell_df['SUM_RLF_VALUE'] + float(getattr(self, 'latest_unconnected_ues', 0))
+        )
         for sum_col in kpi_sums.keys():
             cell_df[sum_col] = pd.to_numeric(cell_df[sum_col])
             
@@ -545,7 +576,7 @@ class EnergySavingEnv(NsOranEnv):
         for cell in self.cellList:
             current_timestamp = self.last_timestamp
             time_diff_obs = []
-            # bsState convention: state == 0 -> active, state == 1 -> energy-saving.
+            # bsState stores hoAllowed: 1 -> active, 0 -> energy-saving.
             current_state_raw = self.cells_states.get(cell, 1)
             current_state = 1 if current_state_raw == 0 else 0
             
@@ -568,7 +599,7 @@ class EnergySavingEnv(NsOranEnv):
         return cell_df
     
     def bs_states_list(self):
-        cell_states_table = self.datalake.read_table('bsState')
+        cell_states_table = self.datalake.read_rows_at_timestamp('bsState', self.last_timestamp)
         states_of_interest = []
         for cell_state in cell_states_table:
             if cell_state[0] == self.last_timestamp:
